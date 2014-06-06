@@ -1,0 +1,256 @@
+<erldriver name="unixdom" abbrev="s1"
+           default_async_calls="0" default_debug_verbose="0">
+
+<summary>EDTK implementation of UNIX domain socket driver (incomplete!)</summary>
+
+<cpy>Copyright (c) 2004, Scott Lystig Fritchie. All rights reserved.</cpy>
+<cpy>5-Oct-2007 - Minor TCP compatibility additions done by Serge Aleynikov &lt;saleyn@gmail.com&th;</cpy>
+<cpy>See the file "LICENSE" at the top of the source distribution for</cpy>
+<cpy>full license terms.</cpy>
+
+<stash size="3"/>
+
+<verbatim place="top_cpp_stuff">
+#include &lt;stdio.h>
+#include &lt;time.h>
+#include &lt;fcntl.h>
+#include &lt;errno.h>
+#include &lt;string.h>
+#include &lt;sys/types.h>
+#include &lt;sys/stat.h>
+#include &lt;sys/socket.h>
+#include &lt;sys/un.h>
+#include &lt;netinet/in.h>	/* htonl() et al. */
+#include &lt;arpa/inet.h>
+
+#include &lt;my-unixdom.h>
+</verbatim>
+
+<include name="unixdom.h" style="angle"/>
+<!-- <valmap name="fd" ctype="int" maxsize="32" initial_num_slots="32" initial_val="-1" cleanup_func="cleanup_valmap_fd_index"/> -->
+
+<func name="null">
+ <return ctype="void"/>
+</func>
+
+<func name="open" cname="my_open">
+ <arg name="filename" ctype="char *" ser_type="binary" nulterm="1"/>
+ <arg name="flags" ctype="int"/>
+ <return ctype="int" name="ret_int" valmap_name="fd" valmap_type="start"
+         expect=">= 0" expect_errval="errno"/>
+</func>
+
+<!--
+  The getfd func is necessary because we want to use the valmap
+  feature to be able to clean up file descriptors if our owning Erlang
+  process crashes ... but valmaps also (intentionally) hide the value
+  of the values they store.  We want to expose the file descriptor
+  value, so use my_getfd().
+-->
+
+<func name="getfd" cname="my_getfd">
+ <arg name="fd" ctype="int" valmap_name="fd"/>
+ <return ctype="int" name="ret_int"/>
+</func>
+
+<func name="closefd" cname="close">
+ <arg name="fd" ctype="int"/>
+ <return ctype="int" name="ret_int" expect="== 0" expect_errval="errno"/>
+ <hack place="post-deserialize" type="verbatim">
+        {
+            int i;
+            for (i = 0; i &lt; sizeof(desc->valmap_fd); i++)
+                if (desc->valmap_fd[i] == c->i.fd)
+                   desc->valmap_fd[i] = -1;
+        }
+ </hack>
+</func>
+
+<func name="sendfd" cname="my_sendfd">
+ <arg name="unixdom_fd" ctype="int"/>
+ <arg name="fd_to_be_sent" ctype="int"/>
+ <return ctype="int" name="ret_int_t" etype="integer"
+         expect="== 0" expect_errval="errno"/>
+</func>
+
+<func name="receivefd" cname="my_receivefd">
+ <arg name="unixdom_fd" ctype="int"/>
+ <return ctype="int" name="ret_int_t" etype="integer"
+         expect=">= 0" expect_errval="errno"/>
+</func>
+
+<func name="close">
+ <arg name="fd" ctype="int" valmap_name="fd"/>
+ <!-- QQQ valmap return processing is a bit weird.  We specify
+      valmap_name on an input arg _and_ we specify it on the return
+      item, along with the 'valmap_type="stop"' attrib.
+ -->
+ <return ctype="int" name="ret_int" valmap_name="fd" valmap_type="stop"
+         expect="== 0" expect_errval="errno"/>
+</func>
+
+<func name="write">
+ <arg name="fd" ctype="int" valmap_name="fd"/>
+ <arg name="ptr" ctype="char *" ser_type="binary" binlen2stash="0"/>
+ <arg name="size" ctype="size_t" noerlcall="1" usestash="0"/>
+ <return ctype="ssize_t" name="ret_ssize_t" etype="integer"/>
+</func>
+
+<func name="read">
+ <arg name="fd" ctype="int" valmap_name="fd"/>
+ <arg name="ptr" ctype="char *" noerlcall="1"/>
+ <arg name="size" ctype="size_t" ser_type="integer"/>
+ <return ctype="ssize_t" name="ret_ssize_t" etype="integer"
+         xreturn="1_ptr_ssize_t"/>
+ <hack place="post-deserialize" type="verbatim">
+	edtk_debug("XXX c->i.size = %d\r\n", c->i.size);
+	if ((c->i.ptr = (char *) edtk_driver_alloc_wrapper(c->i.size)) == NULL) {
+	    goto error;
+	}
+ </hack>
+</func>
+
+<valmap name="fd" ctype="int" maxsize="32" initial_val="-1"
+        cleanup_func="close"/>
+
+<xtra_return name="1_ptr_ssize_t">
+ <xtra_ok>
+  <xtra_val etype="binary" valtype="erl_drv_bin" val="c->i.ptr"
+            offset="0" length="c->o.ret_ssize_t"/>
+ </xtra_ok>
+</xtra_return>
+
+<custom_erl name="gen_tcp">
+<export>
+%% Added by Serge Aleynikov &lt;saleyn&at;gmail.com&gt; to allow UDS socket wrapping to `gen_tcp'.
+-export([listen/3, connect/3, accept/1, accept/2, async_accept/1, tcp_close/2, set_sockopt/2]).
+</export>
+<code>
+%% @spec (Port, Filename::string(), Opts) -> {ok, LSock::socket()} |
+%%                                           {error, Reason::string()}
+%%         Port = unixdom_driver_port()
+%%         Opts = [Opt]
+%% @doc Sets up a UNIX Domain socket to listen on the `Filename' on the local host.
+%%      See `gen_tcp:listen/2' and `inet:setopts/2' for a list of available options.
+%% @end
+listen(Port, Filename, Opts) when is_port(Port) ->
+    try
+        case open(Port, Filename, 1) of
+        {ok,    MasterUSock} -> ok;
+        {error, MasterUSock} -> throw({error, {open, MasterUSock}})
+        end,
+
+        case getfd(Port, MasterUSock) of
+        {ok,    Val} -> ok;
+        {error, Val} -> throw({error, {getfd, Val}})
+        end,
+
+        case gen_tcp:listen(0, Opts ++ [{fd, Val}]) of
+        {ok,    ListenSock} -> {ok, ListenSock};
+        {error, ListenSock} -> throw({error, {fdopen, ListenSock}})
+        end
+    catch {error, {Action, Reason}} ->
+        Err = lists:flatten(io_lib:format("~w: ~s", [Action, inet:format_error(Reason)])),
+        throw({error, Err})
+    end.
+
+%% @spec (Port, Filename::string(), Opts) -> {ok, Sock::socket()} |
+%%                                           {error, Reason::string()}
+%%         Port = unixdom_driver_port()
+%%         Opts = [Opt]
+%% @doc Connects to a server on UDS socket associated with the `Filename' on the local host.
+%%      See `gen_tcp:connect/2' and `inet:setopts/2' for a list of available options.
+%% @end
+connect(Port, Filename, Opts) when is_port(Port), is_list(Filename) ->
+    try
+        case open(Port, Filename, 0) of
+        {ok,    ClntSock} -> ok;
+        {error, ClntSock} -> throw({error, io_lib:format("Can't open a uds socket: ~w", [ClntSock])})
+        end,
+
+        case getfd(Port, ClntSock) of
+        {ok,    Fd} -> ok;
+        {error, Fd} -> throw({error, io_lib:format("Can't get file descriptor: ~w", [Fd])})
+        end,
+
+        case gen_tcp:fdopen(Fd, []) of
+        {ok,    Sock} -> ok;
+        {error, Sock} -> throw({error, inet:format_error(Sock)})
+        end,
+
+        inet_db:register_socket(Sock, inet_tcp),
+
+        case prim_inet:setopts(Sock, Opts) of
+        ok            -> {ok, Sock};
+        {error, What} -> throw({error, io_lib:format("setopts failed: ~s", [What])})
+        end
+    catch {error, Error} ->
+        throw({error, lists:flatten(Error)})
+    end.
+
+%% @spec (LSock::socket()) -> {ok, Sock::socket()} |
+%%                            {error, Reason::string()}
+%% @doc Accepts an incoming connection request on a listen socket. Socket must be a
+%%      socket returned from `listen/3'.  This function blocks indefinitely until a
+%%      client connection is established.
+%% @end
+accept(LSock) ->
+    gen_tcp:accept(LSock).
+
+%% @spec (LSock::socket(), Timeout) -> {ok, Sock::socket()} |
+%%                                     {error, Reason::string()}
+%%          Timeout = integer() | infinity
+%% @doc Accepts an incoming connection request on a listen socket. Socket must be a
+%%      socket returned from `listen/3'. Timeout specifies a timeout value in ms.
+%% @end
+accept(LSock, Timeout) ->
+    gen_tcp:accept(LSock, Timeout).
+
+%% @spec (LSock::socket()) -> {ok, Ref::integer()}
+%% @doc An asynchronous version of `accept/1'.  The caller will receive
+%%      `{inet_async, LSock, Ref::integer(), {ok, CliSocket::socket()}}' or
+%%      `{inet_async, ListSock, Ref, {error, Reason}}' upon successful/unsuccessful
+%%      client connection.  The function needs to be called again in order to
+%%      begin asynchronous accept of the next client socket.  When a successful
+%%      socket message `{ok, CliSocket::socket()}' is received, the server must
+%%      call `set_sockopt/2' function in order to register the socket with the inet
+%%      driver.
+%% @end
+async_accept(LSock) ->
+    prim_inet:async_accept(LSock, -1).
+
+%% @spec (Port, Sock::socket()) -> ok | {error, Reason::string()}
+%%         Port = unixdom_driver_port()
+%% @doc Close a UDS socket previously opened with `connect/3' or `listen/3'.
+%% @end
+tcp_close(Port, Sock) ->
+    case inet:getfd(Sock) of
+    {ok, Fd} ->
+        gen_tcp:close(Sock),
+        case closefd(Port, Fd) of 
+        {ok, _} -> ok;
+        Error   -> Error
+        end;
+    Error ->
+        Error
+    end.
+
+%% @spec (LSock::socket(), Sock::socket()) -> ok | {error, Reason::string()}
+%% @doc Set socket options and register `Sock' with inet driver.
+%% @end
+set_sockopt(ListSock, CliSocket) ->
+    true = inet_db:register_socket(CliSocket, inet_tcp),
+    case prim_inet:getopts(ListSock, [active, nodelay, keepalive, delay_send]) of
+    {ok, Opts} ->
+        case prim_inet:setopts(CliSocket, Opts) of
+        ok    -> ok;
+        Error -> gen_tcp:close(CliSocket), Error
+        end;
+    Error ->
+        gen_tcp:close(CliSocket), Error
+    end.
+</code>
+</custom_erl>
+
+</erldriver>
+

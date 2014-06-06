@@ -1,5 +1,7 @@
 .eunit
 deps
+ebin
+priv/unixdom.so
 *.o
 *.beam
 *.plt
